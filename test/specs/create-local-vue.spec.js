@@ -8,7 +8,7 @@ import ComponentWithRouter from '~resources/components/component-with-router.vue
 import ComponentWithSyncError from '~resources/components/component-with-sync-error.vue'
 import ComponentWithAsyncError from '~resources/components/component-with-async-error.vue'
 import { describeWithShallowAndMount, vueVersion } from '~resources/utils'
-import { itDoNotRunIf, itSkipIf } from 'conditional-specs'
+import { itSkipIf } from 'conditional-specs'
 
 describeWithShallowAndMount('createLocalVue', mountingMethod => {
   it('installs Vuex without polluting global Vue', () => {
@@ -66,41 +66,36 @@ describeWithShallowAndMount('createLocalVue', mountingMethod => {
     expect(typeof freshWrapper.vm.$route).toEqual('undefined')
   })
 
-  itDoNotRunIf(
-    mountingMethod.name === 'shallowMount',
-    'Router should work properly with local Vue',
-    async () => {
-      const localVue = createLocalVue()
-      localVue.use(VueRouter)
-      const routes = [
-        {
-          path: '/',
-          component: {
-            render: h => h('div', 'home')
-          }
-        },
-        {
-          path: '/foo',
-          component: {
-            render: h => h('div', 'foo')
-          }
-        }
-      ]
-      const router = new VueRouter({
-        routes
-      })
-      const wrapper = mountingMethod(ComponentWithRouter, { localVue, router })
-      expect(wrapper.vm.$route).toBeTruthy()
-
-      expect(wrapper.text()).toContain('home')
-
-      await wrapper.find('a').trigger('click')
-      expect(wrapper.text()).toContain('foo')
-
-      const freshWrapper = mountingMethod(Component)
-      expect(typeof freshWrapper.vm.$route).toEqual('undefined')
+  it('works with VueRouter', async () => {
+    if (mountingMethod.name === 'shallowMount') {
+      return
     }
-  )
+    const localVue = createLocalVue()
+    localVue.use(VueRouter)
+    const Foo = {
+      name: 'Foo',
+      render: h => h('span', 'Foo component')
+    }
+    const routes = [{ path: '/foo', component: Foo }]
+    const router = new VueRouter({
+      routes
+    })
+    const wrapper = mountingMethod(ComponentWithRouter, {
+      localVue,
+      router
+    })
+
+    expect(wrapper.html()).not.toContain('Foo component')
+    expect(wrapper.vm.$route).toBeTruthy()
+
+    await wrapper.vm.$router.push('/foo')
+    expect(wrapper.html()).toContain('Foo component')
+
+    await wrapper.vm.$router.push('/')
+    expect(wrapper.html()).not.toContain('Foo component')
+    await wrapper.find('a').trigger('click')
+    expect(wrapper.html()).toContain('Foo component')
+  })
 
   it('use can take additional arguments', () => {
     const localVue = createLocalVue()
@@ -152,6 +147,66 @@ describeWithShallowAndMount('createLocalVue', mountingMethod => {
   )
 
   itSkipIf(
+    vueVersion < 2.6,
+    'Exception suppresed in `errorHandler` is not logged to console.error',
+    async () => {
+      const component = Vue.component('TestComponent', {
+        template: '<button id="btn" @click="clickHandler">Click me</button>',
+        methods: {
+          clickHandler() {
+            throw new Error('Should not be logged')
+          }
+        }
+      })
+      const errorHandler = jest.fn()
+      const localVue = createLocalVue({
+        errorHandler
+      })
+      const wrapper = mountingMethod(component, { localVue })
+      await wrapper.vm.$nextTick()
+
+      const { error } = global.console
+      const spy = jest.spyOn(global.console, 'error')
+      await wrapper.trigger('click')
+      global.console.error = error
+      expect(spy).not.toHaveBeenCalled()
+    }
+  )
+
+  itSkipIf(
+    vueVersion < 2.6,
+    'Exception raised in `errorHandler` bubbles up',
+    async () => {
+      const component = Vue.component('TestComponent', {
+        template: '<button id="btn" @click="clickHandler">Click me</button>',
+        methods: {
+          clickHandler() {
+            throw new Error()
+          }
+        }
+      })
+      const errorHandler = (err, vm, info) => {
+        if (err) {
+          throw new Error('An error that should log')
+        }
+      }
+      const localVue = createLocalVue({
+        errorHandler
+      })
+      const wrapper = mountingMethod(component, { localVue })
+      await wrapper.vm.$nextTick()
+
+      const { error } = global.console
+      const spy = jest.spyOn(global.console, 'error')
+      await wrapper.trigger('click')
+      global.console.error = error
+      expect(spy).toHaveBeenCalledWith(
+        '[Vue warn]: Error in config.errorHandler: "Error: An error that should log"'
+      )
+    }
+  )
+
+  itSkipIf(
     process.env.TEST_ENV === 'browser' || vueVersion < 2.6,
     'Calls `errorHandler` when an error is thrown asynchronously',
     async () => {
@@ -168,6 +223,29 @@ describeWithShallowAndMount('createLocalVue', mountingMethod => {
       } finally {
         // asserting arguments is a bit difficult due to multiple Vue version support. Please see https://vuejs.org/v2/api/#errorHandler for more details
         expect(errorHandler).toHaveBeenCalledTimes(1)
+      }
+    }
+  )
+
+  // This test is related to the issue 1768.
+  // See: https://github.com/vuejs/vue-test-utils/issues/1768
+  itSkipIf(
+    process.env.TEST_ENV === 'browser' || vueVersion < 2.6,
+    'Does not exceed maximum call stack size when no custom error handler is defined',
+    async () => {
+      const { error } = global.console
+      const spy = jest.spyOn(global.console, 'error')
+      const localVue = createLocalVue()
+
+      try {
+        mountingMethod(ComponentWithSyncError, { localVue })
+      } catch {
+        const expected = expect.stringMatching(
+          /Maximum call stack size exceeded/
+        )
+
+        global.console.error = error
+        expect(spy).not.toHaveBeenCalledWith(expected)
       }
     }
   )

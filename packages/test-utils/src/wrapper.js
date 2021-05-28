@@ -1,6 +1,5 @@
 // @flow
 
-import Vue from 'vue'
 import pretty from 'pretty'
 import getSelector from './get-selector'
 import {
@@ -9,7 +8,6 @@ import {
   VUE_VERSION,
   DOM_SELECTOR
 } from 'shared/consts'
-import config from './config'
 import WrapperArray from './wrapper-array'
 import ErrorWrapper from './error-wrapper'
 import {
@@ -210,7 +208,7 @@ export default class Wrapper implements BaseWrapper {
   }
 
   /**
-   * Utility to check wrapper exists. Returns true as Wrapper always exists
+   * Utility to check wrapper exists.
    */
   exists(): boolean {
     if (this.vm) {
@@ -238,6 +236,20 @@ export default class Wrapper implements BaseWrapper {
   }
 
   /**
+   * Gets first node in tree of the current wrapper that
+   * matches the provided selector.
+   */
+  getComponent(rawSelector: Selector): Wrapper {
+    this.__warnIfDestroyed()
+
+    const found = this.findComponent(rawSelector)
+    if (found instanceof ErrorWrapper) {
+      throw new Error(`Unable to get ${rawSelector} within: ${this.html()}`)
+    }
+    return found
+  }
+
+  /**
    * Finds first DOM node in tree of the current wrapper that
    * matches the provided selector.
    */
@@ -248,7 +260,7 @@ export default class Wrapper implements BaseWrapper {
     if (selector.type !== DOM_SELECTOR) {
       warnDeprecated(
         'finding components with `find` or `get`',
-        'Use `findComponent` instead'
+        'Use `findComponent` and `getComponent` instead'
       )
     }
 
@@ -707,71 +719,49 @@ export default class Wrapper implements BaseWrapper {
     if (!this.vm) {
       throwError(`wrapper.setProps() can only be called on a Vue instance`)
     }
+
+    // $FlowIgnore : Problem with possibly null this.vm
+    if (!this.vm.$parent.$options.$_isWrapperParent) {
+      throwError(
+        `wrapper.setProps() can only be called for top-level component`
+      )
+    }
+
     this.__warnIfDestroyed()
 
-    // Save the original "silent" config so that we can directly mutate props
-    const originalConfig = Vue.config.silent
-    Vue.config.silent = config.silent
-
-    try {
-      Object.keys(data).forEach(key => {
-        // Don't let people set entire objects, because reactivity won't work
-        if (
-          typeof data[key] === 'object' &&
-          data[key] !== null &&
-          // $FlowIgnore : Problem with possibly null this.vm
-          data[key] === this.vm[key]
-        ) {
-          throwError(
-            `wrapper.setProps() called with the same object of the existing ` +
-              `${key} property. You must call wrapper.setProps() with a new ` +
-              `object to trigger reactivity`
-          )
-        }
-
-        if (
-          !this.vm ||
-          !this.vm.$options._propKeys ||
-          !this.vm.$options._propKeys.some(prop => prop === key)
-        ) {
-          if (VUE_VERSION > 2.3) {
-            // $FlowIgnore : Problem with possibly null this.vm
-            this.vm.$attrs[key] = data[key]
-            return nextTick()
-          }
-          throwError(
-            `wrapper.setProps() called with ${key} property which ` +
-              `is not defined on the component`
-          )
-        }
-
-        // Actually set the prop
+    Object.keys(data).forEach(key => {
+      // Don't let people set entire objects, because reactivity won't work
+      if (
+        typeof data[key] === 'object' &&
+        data[key] !== null &&
         // $FlowIgnore : Problem with possibly null this.vm
-        this.vm[key] = data[key]
-      })
+        data[key] === this.vm[key]
+      ) {
+        throwError(
+          `wrapper.setProps() called with the same object of the existing ` +
+            `${key} property. You must call wrapper.setProps() with a new ` +
+            `object to trigger reactivity`
+        )
+      }
+
+      if (
+        VUE_VERSION <= 2.3 &&
+        (!this.vm ||
+          !this.vm.$options._propKeys ||
+          !this.vm.$options._propKeys.some(prop => prop === key))
+      ) {
+        throwError(
+          `wrapper.setProps() called with ${key} property which ` +
+            `is not defined on the component`
+        )
+      }
 
       // $FlowIgnore : Problem with possibly null this.vm
-      this.vm.$forceUpdate()
-      return new Promise(resolve => {
-        nextTick().then(() => {
-          const isUpdated = Object.keys(data).some(key => {
-            return (
-              // $FlowIgnore : Problem with possibly null this.vm
-              this.vm[key] === data[key] ||
-              // $FlowIgnore : Problem with possibly null this.vm
-              (this.vm.$attrs && this.vm.$attrs[key] === data[key])
-            )
-          })
-          return !isUpdated ? this.setProps(data).then(resolve()) : resolve()
-        })
-      })
-    } catch (err) {
-      throw err
-    } finally {
-      // Ensure you teardown the modifications you made to the user's config
-      // After all the props are set, then reset the state
-      Vue.config.silent = originalConfig
-    }
+      const parent = this.vm.$parent
+      parent.$set(parent.vueTestUtils_childProps, key, data[key])
+    })
+
+    return nextTick()
   }
 
   /**
@@ -840,6 +830,33 @@ export default class Wrapper implements BaseWrapper {
   }
 
   /**
+   * Simulates event triggering
+   */
+  __simulateTrigger(type: string, options?: Object): void {
+    const regularEventTrigger = (type, options) => {
+      const event = createDOMEvent(type, options)
+      return this.element.dispatchEvent(event)
+    }
+
+    const focusEventTrigger = (type, options) => {
+      if (this.element instanceof HTMLElement) {
+        return this.element.focus()
+      }
+
+      regularEventTrigger(type, options)
+    }
+
+    const triggerProcedureMap = {
+      focus: focusEventTrigger,
+      __default: regularEventTrigger
+    }
+
+    const triggerFn = triggerProcedureMap[type] || triggerProcedureMap.__default
+
+    return triggerFn(type, options)
+  }
+
+  /**
    * Dispatches a DOM event on wrapper
    */
   trigger(type: string, options: Object = {}): Promise<void> {
@@ -879,8 +896,7 @@ export default class Wrapper implements BaseWrapper {
       return nextTick()
     }
 
-    const event = createDOMEvent(type, options)
-    this.element.dispatchEvent(event)
+    this.__simulateTrigger(type, options)
     return nextTick()
   }
 }

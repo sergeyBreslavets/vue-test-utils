@@ -18,6 +18,8 @@ import {
 } from '../shared/validators'
 import { compileTemplate } from '../shared/compile-template'
 
+const FUNCTION_PLACEHOLDER = '[Function]'
+
 function isVueComponentStub(comp): boolean {
   return (comp && comp.template) || isVueComponent(comp)
 }
@@ -56,30 +58,9 @@ function getCoreProperties(componentOptions: Component): Object {
     style: componentOptions.style,
     normalizedStyle: componentOptions.normalizedStyle,
     nativeOn: componentOptions.nativeOn,
-    functional: componentOptions.functional
+    functional: componentOptions.functional,
+    abstract: componentOptions.abstract
   }
-}
-
-function createClassString(staticClass, dynamicClass) {
-  // :class="someComputedObject" can return a string, object or undefined
-  // if it is a string, we don't need to do anything special.
-  let evaluatedDynamicClass = dynamicClass
-
-  // if it is an object, eg { 'foo': true }, we need to evaluate it.
-  // see https://github.com/vuejs/vue-test-utils/issues/1474 for more context.
-  if (typeof dynamicClass === 'object') {
-    evaluatedDynamicClass = Object.keys(dynamicClass).reduce((acc, key) => {
-      if (dynamicClass[key]) {
-        return acc + ' ' + key
-      }
-      return acc
-    }, '')
-  }
-
-  if (staticClass && evaluatedDynamicClass) {
-    return staticClass + ' ' + evaluatedDynamicClass
-  }
-  return staticClass || evaluatedDynamicClass
 }
 
 function resolveOptions(component, _Vue) {
@@ -133,24 +114,19 @@ export function createStubFromComponent(
     render(h, context) {
       return h(
         tagName,
-        {
-          ref: componentOptions.functional ? context.data.ref : undefined,
-          domProps: componentOptions.functional
-            ? context.data.domProps
-            : undefined,
-          attrs: componentOptions.functional
-            ? {
-                ...context.props,
-                ...context.data.attrs,
-                class: createClassString(
-                  context.data.staticClass,
-                  context.data.class
-                )
+        componentOptions.functional
+          ? {
+              ...context.data,
+              attrs: {
+                ...shapeStubProps(context.props),
+                ...context.data.attrs
               }
-            : {
-                ...this.$props
+            }
+          : {
+              attrs: {
+                ...shapeStubProps(this.$props)
               }
-        },
+            },
         context
           ? context.children
           : this.$options._renderChildren ||
@@ -160,6 +136,27 @@ export function createStubFromComponent(
       )
     }
   }
+}
+
+function shapeStubProps(props) {
+  const shapedProps: Object = {}
+  for (const propName in props) {
+    if (typeof props[propName] === 'function') {
+      shapedProps[propName] = FUNCTION_PLACEHOLDER
+      continue
+    }
+
+    if (Array.isArray(props[propName])) {
+      shapedProps[propName] = props[propName].map(value => {
+        return typeof value === 'function' ? FUNCTION_PLACEHOLDER : value
+      })
+      continue
+    }
+
+    shapedProps[propName] = props[propName]
+  }
+
+  return shapedProps
 }
 
 // DEPRECATED: converts string stub to template stub.

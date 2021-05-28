@@ -1792,7 +1792,11 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
     if (!config.showDeprecationWarnings) { return }
     var msg = method + " is deprecated and will be removed in the next major version.";
     if (fallback) { msg += " " + fallback + "."; }
-    warn(msg);
+    if (config.deprecationWarningHandler) {
+      config.deprecationWarningHandler(method, msg);
+    } else {
+      warn(msg);
+    }
   }
 
   // 
@@ -2234,6 +2238,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
 
   // 
 
+  var FUNCTION_PLACEHOLDER = '[Function]';
+
   function isVueComponentStub(comp) {
     return (comp && comp.template) || isVueComponent(comp)
   }
@@ -2272,30 +2278,9 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
       style: componentOptions.style,
       normalizedStyle: componentOptions.normalizedStyle,
       nativeOn: componentOptions.nativeOn,
-      functional: componentOptions.functional
+      functional: componentOptions.functional,
+      abstract: componentOptions.abstract
     }
-  }
-
-  function createClassString(staticClass, dynamicClass) {
-    // :class="someComputedObject" can return a string, object or undefined
-    // if it is a string, we don't need to do anything special.
-    var evaluatedDynamicClass = dynamicClass;
-
-    // if it is an object, eg { 'foo': true }, we need to evaluate it.
-    // see https://github.com/vuejs/vue-test-utils/issues/1474 for more context.
-    if (typeof dynamicClass === 'object') {
-      evaluatedDynamicClass = Object.keys(dynamicClass).reduce(function (acc, key) {
-        if (dynamicClass[key]) {
-          return acc + ' ' + key
-        }
-        return acc
-      }, '');
-    }
-
-    if (staticClass && evaluatedDynamicClass) {
-      return staticClass + ' ' + evaluatedDynamicClass
-    }
-    return staticClass || evaluatedDynamicClass
   }
 
   function resolveOptions(component, _Vue) {
@@ -2350,17 +2335,13 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
 
         return h(
           tagName,
-          {
-            ref: componentOptions.functional ? context.data.ref : undefined,
-            attrs: componentOptions.functional
-              ? Object.assign({}, context.props,
-                  context.data.attrs,
-                  {class: createClassString(
-                    context.data.staticClass,
-                    context.data.class
-                  )})
-              : Object.assign({}, this.$props)
-          },
+          componentOptions.functional
+            ? Object.assign({}, context.data,
+                {attrs: Object.assign({}, shapeStubProps(context.props),
+                  context.data.attrs)})
+            : {
+                attrs: Object.assign({}, shapeStubProps(this.$props))
+              },
           context
             ? context.children
             : this.$options._renderChildren ||
@@ -2368,6 +2349,27 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
                 )
         )
       }})
+  }
+
+  function shapeStubProps(props) {
+    var shapedProps = {};
+    for (var propName in props) {
+      if (typeof props[propName] === 'function') {
+        shapedProps[propName] = FUNCTION_PLACEHOLDER;
+        continue
+      }
+
+      if (Array.isArray(props[propName])) {
+        shapedProps[propName] = props[propName].map(function (value) {
+          return typeof value === 'function' ? FUNCTION_PLACEHOLDER : value
+        });
+        continue
+      }
+
+      shapedProps[propName] = props[propName];
+    }
+
+    return shapedProps
   }
 
   // DEPRECATED: converts string stub to template stub.
@@ -2548,13 +2550,13 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
 
   function objectWithoutProperties (obj, exclude) { var target = {}; for (var k in obj) if (Object.prototype.hasOwnProperty.call(obj, k) && exclude.indexOf(k) === -1) target[k] = obj[k]; return target; }
 
-  function createContext(options, scopedSlots) {
+  function createContext(options, scopedSlots, currentProps) {
     var on = Object.assign({}, (options.context && options.context.on),
       options.listeners);
     return Object.assign({}, {attrs: Object.assign({}, options.attrs,
         // pass as attrs so that inheritAttrs works correctly
-        // propsData should take precedence over attrs
-        options.propsData)},
+        // props should take precedence over attrs
+        currentProps)},
       (options.context || {}),
       {on: on,
       scopedSlots: scopedSlots})
@@ -2643,22 +2645,32 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
     var originalParentComponentProvide = parentComponentOptions.provide;
     parentComponentOptions.provide = function() {
       return Object.assign({}, getValuesFromCallableOption.call(this, originalParentComponentProvide),
+        // $FlowIgnore
         getValuesFromCallableOption.call(this, options.provide))
     };
 
+    var originalParentComponentData = parentComponentOptions.data;
+    parentComponentOptions.data = function() {
+      return Object.assign({}, getValuesFromCallableOption.call(this, originalParentComponentData),
+        {vueTestUtils_childProps: Object.assign({}, options.propsData)})
+    };
+
     parentComponentOptions.$_doNotStubChildren = true;
+    parentComponentOptions.$_isWrapperParent = true;
     parentComponentOptions._isFunctionalContainer = componentOptions.functional;
     parentComponentOptions.render = function(h) {
       return h(
         Constructor,
-        createContext(options, scopedSlots),
+        createContext(options, scopedSlots, this.vueTestUtils_childProps),
         createChildren(this, h, options)
       )
     };
 
     // options  "propsData" can only be used during instance creation with the `new` keyword
+    // "data" should be set only on component under test to avoid reactivity issues
     var propsData = options.propsData;
-    var rest$1 = objectWithoutProperties( options, ["propsData"] );
+    var data = options.data;
+    var rest$1 = objectWithoutProperties( options, ["propsData", "data"] );
     var rest = rest$1; // eslint-disable-line
     var Parent = _Vue.extend(Object.assign({}, rest,
       parentComponentOptions));
@@ -2701,7 +2713,7 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
     // We want to mirror how Vue resolves component names in SFCs:
     // For example, <test-component />, <TestComponent /> and `<testComponent />
     // all resolve to the same component
-    var componentName = (vm.$options && vm.$options.name) || '';
+    var componentName = vm.name || (vm.$options && vm.$options.name) || '';
     return (
       !!name &&
       (componentName === name ||
@@ -2751,9 +2763,10 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
       ? selector.value.options.functional
       : selector.value.functional;
 
-    var componentInstance = isFunctionalSelector
-      ? node[FUNCTIONAL_OPTIONS]
-      : node.child;
+    var componentInstance =
+      (isFunctionalSelector ? node[FUNCTIONAL_OPTIONS] : node.child) ||
+      node[FUNCTIONAL_OPTIONS] ||
+      node.child;
 
     if (!componentInstance) {
       return false
@@ -2911,13 +2924,14 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
       vm._error = error;
     }
 
+    if (!instancedErrorHandlers.length) {
+      throw error
+    }
     // should be one error handler, as only once can be registered with local vue
     // regardless, if more exist (for whatever reason), invoke the other user defined error handlers
     instancedErrorHandlers.forEach(function (instancedErrorHandler) {
       instancedErrorHandler(error, vm, info);
     });
-
-    throw error
   }
 
   function throwIfInstancesThrew(vm) {
@@ -3041,7 +3055,6 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
     mocks: {},
     methods: {},
     provide: {},
-    silent: true,
     showDeprecationWarnings:
        true
   };
@@ -9030,7 +9043,11 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
       var val = data[key];
       var targetVal = target[key];
 
-      if (isPlainObject(val) && isPlainObject(targetVal)) {
+      if (
+        isPlainObject(val) &&
+        isPlainObject(targetVal) &&
+        Object.keys(val).length > 0
+      ) {
         recursivelySetData(vm, targetVal, val);
       } else {
         vm.$set(target, key, val);
@@ -10269,11 +10286,43 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
     pagedown: 34
   };
 
+  // get from https://github.com/ashubham/w3c-keys/blob/master/index.ts
+  var w3cKeys = {
+    enter: 'Enter',
+    tab: 'Tab',
+    delete: 'Delete',
+    esc: 'Esc',
+    escape: 'Escape',
+    space: ' ',
+    up: 'Up',
+    left: 'Left',
+    right: 'Right',
+    down: 'Down',
+    end: 'End',
+    home: 'Home',
+    backspace: 'Backspace',
+    insert: 'Insert',
+    pageup: 'PageUp',
+    pagedown: 'PageDown'
+  };
+
+  var codeToKeyNameMap = Object.entries(modifiers).reduce(
+    function (acc, ref) {
+      var obj;
+
+      var key = ref[0];
+      var value = ref[1];
+      return Object.assign(acc, ( obj = {}, obj[value] = w3cKeys[key], obj ));
+  },
+    {}
+  );
+
   function getOptions(eventParams) {
     var modifier = eventParams.modifier;
     var meta = eventParams.meta;
     var options = eventParams.options;
     var keyCode = modifiers[modifier] || options.keyCode || options.code;
+    var key = codeToKeyNameMap[keyCode];
 
     return Object.assign({}, options, // What the user passed in as the second argument to #trigger
 
@@ -10282,7 +10331,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
 
       // Any derived options should go here
       keyCode: keyCode,
-      code: keyCode})
+      code: keyCode,
+      key: key || options.key})
   }
 
   function createEvent(eventParams) {
@@ -10395,7 +10445,18 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
     }
   };
 
+  /**
+   * Prints warning if component is destroyed
+   */
+  Wrapper.prototype.__warnIfDestroyed = function __warnIfDestroyed () {
+    if (!this.exists()) {
+      warn('Operations on destroyed component are discouraged');
+    }
+  };
+
   Wrapper.prototype.at = function at () {
+    this.__warnIfDestroyed();
+
     throwError('at() must be called on a WrapperArray');
   };
 
@@ -10403,6 +10464,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    * Returns an Object containing all the attribute/value pairs on the element.
    */
   Wrapper.prototype.attributes = function attributes (key) {
+    this.__warnIfDestroyed();
+
     var attributes = this.element.attributes;
     var attributeMap = {};
     for (var i = 0; i < attributes.length; i++) {
@@ -10418,6 +10481,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    */
   Wrapper.prototype.classes = function classes (className) {
       var this$1 = this;
+
+    this.__warnIfDestroyed();
 
     var classAttribute = this.element.getAttribute('class');
     var classes = classAttribute ? classAttribute.split(' ') : [];
@@ -10449,6 +10514,9 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
       'contains',
       'Use `wrapper.find`, `wrapper.findComponent` or `wrapper.get` instead'
     );
+
+    this.__warnIfDestroyed();
+
     var selector = getSelector(rawSelector, 'contains');
     var nodes = find(this.rootNode, this.vm, selector);
     return nodes.length > 0
@@ -10506,7 +10574,7 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
   };
 
   /**
-   * Utility to check wrapper exists. Returns true as Wrapper always exists
+   * Utility to check wrapper exists.
    */
   Wrapper.prototype.exists = function exists () {
     if (this.vm) {
@@ -10524,9 +10592,25 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    * matches the provided selector.
    */
   Wrapper.prototype.get = function get (rawSelector) {
+    this.__warnIfDestroyed();
+
     var found = this.find(rawSelector);
     if (found instanceof ErrorWrapper) {
       throw new Error(("Unable to find " + rawSelector + " within: " + (this.html())))
+    }
+    return found
+  };
+
+  /**
+   * Gets first node in tree of the current wrapper that
+   * matches the provided selector.
+   */
+  Wrapper.prototype.getComponent = function getComponent (rawSelector) {
+    this.__warnIfDestroyed();
+
+    var found = this.findComponent(rawSelector);
+    if (found instanceof ErrorWrapper) {
+      throw new Error(("Unable to get " + rawSelector + " within: " + (this.html())))
     }
     return found
   };
@@ -10536,11 +10620,13 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    * matches the provided selector.
    */
   Wrapper.prototype.find = function find (rawSelector) {
+    this.__warnIfDestroyed();
+
     var selector = getSelector(rawSelector, 'find');
     if (selector.type !== DOM_SELECTOR) {
       warnDeprecated(
-        'finding components with `find`',
-        'Use `findComponent` instead'
+        'finding components with `find` or `get`',
+        'Use `findComponent` and `getComponent` instead'
       );
     }
 
@@ -10552,6 +10638,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    * matches the provided selector.
    */
   Wrapper.prototype.findComponent = function findComponent (rawSelector) {
+    this.__warnIfDestroyed();
+
     var selector = getSelector(rawSelector, 'findComponent');
     if (!this.vm && !this.isFunctionalComponent) {
       throwError(
@@ -10585,6 +10673,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    * the provided selector.
    */
   Wrapper.prototype.findAll = function findAll (rawSelector) {
+    this.__warnIfDestroyed();
+
     var selector = getSelector(rawSelector, 'findAll');
     if (selector.type !== DOM_SELECTOR) {
       warnDeprecated(
@@ -10600,6 +10690,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    * the provided selector.
    */
   Wrapper.prototype.findAllComponents = function findAllComponents (rawSelector) {
+    this.__warnIfDestroyed();
+
     var selector = getSelector(rawSelector, 'findAll');
     if (!this.vm) {
       throwError(
@@ -10635,6 +10727,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    * Returns HTML of element as a string
    */
   Wrapper.prototype.html = function html () {
+    this.__warnIfDestroyed();
+
     return pretty(this.element.outerHTML)
   };
 
@@ -10642,6 +10736,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    * Checks if node matches selector or component definition
    */
   Wrapper.prototype.is = function is (rawSelector) {
+    this.__warnIfDestroyed();
+
     var selector = getSelector(rawSelector, 'is');
 
     if (selector.type === DOM_SELECTOR) {
@@ -10668,6 +10764,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
       'Consider a custom matcher such as those provided in jest-dom: https://github.com/testing-library/jest-dom#tobeempty. ' +
         'When using with findComponent, access the DOM element with findComponent(Comp).element'
     );
+    this.__warnIfDestroyed();
+
     if (!this.vnode) {
       return this.element.innerHTML === ''
     }
@@ -10692,6 +10790,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    * Checks if node is visible
    */
   Wrapper.prototype.isVisible = function isVisible () {
+    this.__warnIfDestroyed();
+
     return isElementVisible(this.element)
   };
 
@@ -10701,6 +10801,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    */
   Wrapper.prototype.isVueInstance = function isVueInstance () {
     warnDeprecated("isVueInstance");
+    this.__warnIfDestroyed();
+
     return !!this.vm
   };
 
@@ -10710,6 +10812,7 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    */
   Wrapper.prototype.name = function name () {
     warnDeprecated("name");
+    this.__warnIfDestroyed();
 
     if (this.vm) {
       return (
@@ -10735,6 +10838,7 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
       var this$1 = this;
 
     warnDeprecated("overview");
+    this.__warnIfDestroyed();
 
     if (!this.vm) {
       throwError("wrapper.overview() can only be called on a Vue instance");
@@ -10821,6 +10925,7 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
     if (!this.vm) {
       throwError('wrapper.props() must be called on a Vue instance');
     }
+    this.__warnIfDestroyed();
 
     var props = {};
     var keys = this.vm && this.vm.$options._propKeys;
@@ -10846,6 +10951,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    */
   Wrapper.prototype.setChecked = function setChecked (checked) {
       if ( checked === void 0 ) checked = true;
+
+    this.__warnIfDestroyed();
 
     if (typeof checked !== 'boolean') {
       throwError('wrapper.setChecked() must be passed a boolean');
@@ -10896,6 +11003,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    * @deprecated
    */
   Wrapper.prototype.setSelected = function setSelected () {
+    this.__warnIfDestroyed();
+
     var tagName = this.element.tagName;
 
     if (tagName === 'SELECT') {
@@ -10941,6 +11050,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
       throwError("wrapper.setData() can only be called on a Vue instance");
     }
 
+    this.__warnIfDestroyed();
+
     recursivelySetData(this.vm, this.vm, data);
     return nextTick()
   };
@@ -10960,6 +11071,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
     if (!this.vm) {
       throwError("wrapper.setMethods() can only be called on a Vue instance");
     }
+    this.__warnIfDestroyed();
+
     Object.keys(methods).forEach(function (key) {
       // $FlowIgnore : Problem with possibly null this.vm
       this$1.vm[key] = methods[key];
@@ -10990,69 +11103,48 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
       throwError("wrapper.setProps() can only be called on a Vue instance");
     }
 
-    // Save the original "silent" config so that we can directly mutate props
-    var originalConfig = Vue__default['default'].config.silent;
-    Vue__default['default'].config.silent = config.silent;
+    // $FlowIgnore : Problem with possibly null this.vm
+    if (!this.vm.$parent.$options.$_isWrapperParent) {
+      throwError(
+        "wrapper.setProps() can only be called for top-level component"
+      );
+    }
 
-    try {
-      Object.keys(data).forEach(function (key) {
-        // Don't let people set entire objects, because reactivity won't work
-        if (
-          typeof data[key] === 'object' &&
-          data[key] !== null &&
-          // $FlowIgnore : Problem with possibly null this.vm
-          data[key] === this$1.vm[key]
-        ) {
-          throwError(
-            "wrapper.setProps() called with the same object of the existing " +
-              key + " property. You must call wrapper.setProps() with a new " +
-              "object to trigger reactivity"
-          );
-        }
+    this.__warnIfDestroyed();
 
-        if (
-          !this$1.vm ||
-          !this$1.vm.$options._propKeys ||
-          !this$1.vm.$options._propKeys.some(function (prop) { return prop === key; })
-        ) {
-          if (VUE_VERSION > 2.3) {
-            // $FlowIgnore : Problem with possibly null this.vm
-            this$1.vm.$attrs[key] = data[key];
-            return nextTick()
-          }
-          throwError(
-            "wrapper.setProps() called with " + key + " property which " +
-              "is not defined on the component"
-          );
-        }
-
-        // Actually set the prop
+    Object.keys(data).forEach(function (key) {
+      // Don't let people set entire objects, because reactivity won't work
+      if (
+        typeof data[key] === 'object' &&
+        data[key] !== null &&
         // $FlowIgnore : Problem with possibly null this.vm
-        this$1.vm[key] = data[key];
-      });
+        data[key] === this$1.vm[key]
+      ) {
+        throwError(
+          "wrapper.setProps() called with the same object of the existing " +
+            key + " property. You must call wrapper.setProps() with a new " +
+            "object to trigger reactivity"
+        );
+      }
+
+      if (
+        VUE_VERSION <= 2.3 &&
+        (!this$1.vm ||
+          !this$1.vm.$options._propKeys ||
+          !this$1.vm.$options._propKeys.some(function (prop) { return prop === key; }))
+      ) {
+        throwError(
+          "wrapper.setProps() called with " + key + " property which " +
+            "is not defined on the component"
+        );
+      }
 
       // $FlowIgnore : Problem with possibly null this.vm
-      this.vm.$forceUpdate();
-      return new Promise(function (resolve) {
-        nextTick().then(function () {
-          var isUpdated = Object.keys(data).some(function (key) {
-            return (
-              // $FlowIgnore : Problem with possibly null this.vm
-              this$1.vm[key] === data[key] ||
-              // $FlowIgnore : Problem with possibly null this.vm
-              (this$1.vm.$attrs && this$1.vm.$attrs[key] === data[key])
-            )
-          });
-          return !isUpdated ? this$1.setProps(data).then(resolve()) : resolve()
-        });
-      })
-    } catch (err) {
-      throw err
-    } finally {
-      // Ensure you teardown the modifications you made to the user's config
-      // After all the props are set, then reset the state
-      Vue__default['default'].config.silent = originalConfig;
-    }
+      var parent = this$1.vm.$parent;
+      parent.$set(parent.vueTestUtils_childProps, key, data[key]);
+    });
+
+    return nextTick()
   };
 
   /**
@@ -11062,6 +11154,7 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
     var tagName = this.element.tagName;
     // $FlowIgnore
     var type = this.attributes().type;
+    this.__warnIfDestroyed();
 
     if (tagName === 'OPTION') {
       throwError(
@@ -11114,7 +11207,38 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    * Return text of wrapper element
    */
   Wrapper.prototype.text = function text () {
+    this.__warnIfDestroyed();
+
     return this.element.textContent.trim()
+  };
+
+  /**
+   * Simulates event triggering
+   */
+  Wrapper.prototype.__simulateTrigger = function __simulateTrigger (type, options) {
+      var this$1 = this;
+
+    var regularEventTrigger = function (type, options) {
+      var event = createDOMEvent(type, options);
+      return this$1.element.dispatchEvent(event)
+    };
+
+    var focusEventTrigger = function (type, options) {
+      if (this$1.element instanceof HTMLElement) {
+        return this$1.element.focus()
+      }
+
+      regularEventTrigger(type, options);
+    };
+
+    var triggerProcedureMap = {
+      focus: focusEventTrigger,
+      __default: regularEventTrigger
+    };
+
+    var triggerFn = triggerProcedureMap[type] || triggerProcedureMap.__default;
+
+    return triggerFn(type, options)
   };
 
   /**
@@ -11122,6 +11246,8 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
    */
   Wrapper.prototype.trigger = function trigger (type, options) {
       if ( options === void 0 ) options = {};
+
+    this.__warnIfDestroyed();
 
     if (typeof type !== 'string') {
       throwError('wrapper.trigger() must be passed a string');
@@ -11157,8 +11283,7 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
       return nextTick()
     }
 
-    var event = createDOMEvent(type, options);
-    this.element.dispatchEvent(event);
+    this.__simulateTrigger(type, options);
     return nextTick()
   };
 
@@ -11221,9 +11346,9 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
     hook(function () {
       wrapperInstances.forEach(function (wrapper) {
         // skip child wrappers created by wrapper.find()
-        if (wrapper.selector) { return }
-
-        wrapper.destroy();
+        if (wrapper.vm || wrapper.isFunctionalComponent) {
+          wrapper.destroy();
+        }
       });
 
       wrapperInstances.length = 0;
@@ -13778,7 +13903,7 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
     instance.config = cloneDeep_1(Vue__default['default'].config);
 
     // if a user defined errorHandler is defined by a localVue instance via createLocalVue, register it
-    instance.config.errorHandler = config.errorHandler || Vue__default['default'].config.errorHandler;
+    instance.config.errorHandler = config.errorHandler;
 
     // option merge strategies need to be exposed by reference
     // so that merge strats registered by plugins can work properly
@@ -13927,7 +14052,9 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
     var parentVm = createInstance(component, mergedOptions, _Vue);
 
     var el =
-      options.attachTo || (options.attachToDocument ? createElement() : undefined);
+      options.attachToDocument || options.attachTo instanceof HTMLBodyElement
+        ? createElement()
+        : options.attachTo;
     var vm = parentVm.$mount(el);
 
     component._Ctor = {};
@@ -14009,6 +14136,7 @@ var VueTestUtils = (function (exports, Vue, vueTemplateCompiler) {
     return shallowMount(component, options)
   }
 
+  exports.ErrorWrapper = ErrorWrapper;
   exports.RouterLinkStub = RouterLinkStub;
   exports.Wrapper = Wrapper;
   exports.WrapperArray = WrapperArray;
